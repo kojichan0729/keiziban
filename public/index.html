@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>こっちゃんねる</title>
+<link rel="icon" type="image/png" href="favicon.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div id="bgLayer" class="bg-layer"></div>
+
+  <header class="site-header">
+    <h1><a href="#/" onclick="renderTop()"><img src="logo.png" alt="こっちゃんねる" class="site-logo"></a></h1>
+    <div id="userAuthArea" class="user-auth-area"></div>
+  </header>
+
+  <nav id="boardNav" class="board-nav"></nav>
+
+  <main id="app"></main>
+
+  <footer class="site-footer">
+    <div>こっちゃんねる - フィードは10分ごとに自動更新されます</div>
+    <div id="adminAuthArea" class="admin-auth-area"></div>
+  </footer>
+
+<script src="app.js"></script>
+</body>
+</html>
