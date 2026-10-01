@@ -16,6 +16,26 @@ const ADMIN_PASSWORD_SALT = '6b3e8db8d0158f278c4932f193f48606';
 const ADMIN_PASSWORD_HASH = 'dd425616ffd275da24fbd151e6cac9cc6126e6f3ca86ca52d5934c698a80518095e31c11780b005c8111d6d166a196a27046b640fbd41871f66982a7b852b610';
 const ADMIN_SESSION_MS = 7 * 24 * 60 * 60 * 1000; // セッション有効期限:7日
 const adminSessions = new Map(); // token -> 有効期限(ms)
+const SESSIONS_FILE = path.join(__dirname, 'data', 'sessions.json');
+
+function saveSessions() {
+  fs.writeFileSync(SESSIONS_FILE, JSON.stringify({
+    admin: Object.fromEntries(adminSessions),
+    user: Object.fromEntries(userSessions),
+  }, null, 2), 'utf-8');
+}
+
+function loadSessions() {
+  try {
+    const data = JSON.parse(fs.readFileSync(SESSIONS_FILE, 'utf-8'));
+    for (const [token, expires] of Object.entries(data.admin || {})) {
+      if (expires > Date.now()) adminSessions.set(token, expires);
+    }
+    for (const [token, session] of Object.entries(data.user || {})) {
+      if (session.expires > Date.now()) userSessions.set(token, session);
+    }
+  } catch (e) { /* 初回 */ }
+}
 
 function verifyAdminPassword(password) {
   const hash = crypto.scryptSync(password, ADMIN_PASSWORD_SALT, 64).toString('hex');
@@ -45,7 +65,9 @@ function requireAdmin(req, res, next) {
 
 // ==== 一般ユーザー認証（管理者ログインとは別） ====
 const USERS_FILE = path.join(__dirname, 'data', 'users.json');
+const DMS_FILE = path.join(__dirname, 'data', 'dms.json');
 const USER_SESSION_MS = 30 * 24 * 60 * 60 * 1000; // 30日
+const MAX_ROOMS_PER_USER = 2;
 const userSessions = new Map(); // token -> { username, expires }
 
 function loadUsers() {
@@ -58,7 +80,49 @@ function loadUsers() {
 function saveUsers(users) {
   fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2), 'utf-8');
 }
+
+function loadDms() {
+  try {
+    return JSON.parse(fs.readFileSync(DMS_FILE, 'utf-8'));
+  } catch (e) {
+    return {};
+  }
+}
+function saveDms(dms) {
+  fs.writeFileSync(DMS_FILE, JSON.stringify(dms, null, 2), 'utf-8');
+}
+let dms = loadDms();
+
+function dmKey(a, b) {
+  return [a, b].sort().join(':');
+}
+
+function migrateUser(user) {
+  if (!user.accountMode) user.accountMode = 'anonymous';
+  if (user.displayName === undefined) user.displayName = '';
+  if (user.bio === undefined) user.bio = '';
+  if (!user.following) user.following = [];
+  if (!user.followedThreads) user.followedThreads = [];
+  return user;
+}
+
+function isPublicUser(username) {
+  const u = users[username];
+  return !!(u && u.accountMode === 'public');
+}
+
+function displayNameOf(username) {
+  const u = users[username];
+  if (!u) return username;
+  if (u.accountMode === 'public' && u.displayName) return u.displayName;
+  return `名無しさん@${username}`;
+}
+
 let users = loadUsers();
+for (const key of Object.keys(users)) {
+  users[key] = migrateUser(users[key]);
+}
+saveUsers(users);
 
 function hashPassword(password, salt) {
   return crypto.scryptSync(password, salt, 64).toString('hex');
@@ -183,10 +247,91 @@ function hashId(str) {
 }
 
 let db = loadData();
+if (!db.boardMeta) db.boardMeta = {};
+if (!db.rooms) db.rooms = {};
 for (const b of BOARDS) {
   if (!db.boards[b.id]) db.boards[b.id] = { threads: {} };
 }
+for (const roomId of Object.keys(db.rooms)) {
+  if (!db.boards[roomId]) db.boards[roomId] = { threads: {} };
+}
 saveData(db);
+
+function isBoardArchived(boardId) {
+  return !!(db.boardMeta[boardId] && db.boardMeta[boardId].archived);
+}
+
+function isRoomBoard(boardId) {
+  return !!(db.rooms && db.rooms[boardId]);
+}
+
+function getRoom(boardId) {
+  return db.rooms && db.rooms[boardId];
+}
+
+function countUserRooms(username) {
+  return Object.values(db.rooms || {}).filter(r => r.owner === username).length;
+}
+
+function getAllBoardsMeta() {
+  const list = BOARDS.map(b => ({
+    id: b.id,
+    name: b.name,
+    category: b.category,
+    archived: isBoardArchived(b.id),
+    archivedAt: db.boardMeta[b.id] && db.boardMeta[b.id].archivedAt,
+    isRoom: false,
+  }));
+  for (const room of Object.values(db.rooms || {})) {
+    list.push({
+      id: room.id,
+      name: room.name,
+      category: 'room',
+      archived: false,
+      owner: room.owner,
+      isRoom: true,
+    });
+  }
+  return list;
+}
+
+function findBoardMeta(boardId) {
+  const staticBoard = BOARDS.find(b => b.id === boardId);
+  if (staticBoard) {
+    return {
+      id: staticBoard.id,
+      name: staticBoard.name,
+      category: staticBoard.category,
+      archived: isBoardArchived(boardId),
+      isRoom: false,
+    };
+  }
+  const room = getRoom(boardId);
+  if (room) {
+    return {
+      id: room.id,
+      name: room.name,
+      category: 'room',
+      archived: false,
+      owner: room.owner,
+      isRoom: true,
+    };
+  }
+  return null;
+}
+
+function requireBoardAccess(req, res, next) {
+  const boardId = req.params.boardId;
+  const meta = findBoardMeta(boardId);
+  if (!meta) return res.status(404).json({ error: '板が見つかりません' });
+  if (meta.isRoom && !currentUsername(req)) {
+    return res.status(401).json({ error: '部屋に入るにはログインが必要です' });
+  }
+  if (meta.archived && req.method !== 'GET' && !isAdminRequest(req)) {
+    return res.status(403).json({ error: 'アーカイブされた板には書き込めません（閲覧のみ）' });
+  }
+  next();
+}
 
 // ==== RSS取得してスレッド化（既存コメントは保持） ====
 async function refreshBoard(board) {
@@ -225,6 +370,7 @@ async function refreshBoard(board) {
 
 async function refreshAllBoards() {
   for (const b of BOARDS) {
+    if (isBoardArchived(b.id)) continue;
     await refreshBoard(b);
   }
 }
@@ -244,7 +390,79 @@ app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
 
 app.get('/api/boards', (req, res) => {
-  res.json(BOARDS.map(b => ({ id: b.id, name: b.name, category: b.category })));
+  const username = currentUsername(req);
+  const includeArchived = req.query.archived === '1';
+  let boards = getAllBoardsMeta();
+  if (includeArchived) {
+    boards = boards.filter(b => b.archived && !b.isRoom);
+  } else {
+    boards = boards.filter(b => !b.archived);
+    if (!username) boards = boards.filter(b => !b.isRoom);
+  }
+  res.json(boards.map(b => ({
+    id: b.id,
+    name: b.name,
+    category: b.category,
+    archived: !!b.archived,
+    archivedAt: b.archivedAt || null,
+    isRoom: !!b.isRoom,
+    owner: b.owner || null,
+    isMine: !!(b.isRoom && b.owner === username),
+  })));
+});
+
+app.post('/api/admin/boards/:boardId/archive', requireAdmin, (req, res) => {
+  const boardId = req.params.boardId;
+  if (!BOARDS.find(b => b.id === boardId)) {
+    return res.status(404).json({ error: '板が見つかりません' });
+  }
+  if (isRoomBoard(boardId)) {
+    return res.status(400).json({ error: '個人の部屋はアーカイブできません' });
+  }
+  const archive = !(req.body && req.body.archive === false);
+  if (archive) {
+    db.boardMeta[boardId] = { archived: true, archivedAt: Date.now() };
+  } else {
+    delete db.boardMeta[boardId];
+  }
+  saveData(db);
+  res.json({
+    archived: archive,
+    archivedAt: db.boardMeta[boardId] && db.boardMeta[boardId].archivedAt,
+  });
+});
+
+app.get('/api/rooms', requireUser, (req, res) => {
+  const myRooms = Object.values(db.rooms || {})
+    .filter(r => r.owner === req.username)
+    .map(r => ({ id: r.id, name: r.name, createdAt: r.createdAt }));
+  res.json({ rooms: myRooms, limit: MAX_ROOMS_PER_USER, count: myRooms.length });
+});
+
+app.post('/api/rooms', requireUser, (req, res) => {
+  let { name } = req.body || {};
+  name = (name || '').toString().trim().slice(0, 30);
+  if (!name) return res.status(400).json({ error: '部屋の名前を入力してください' });
+  if (countUserRooms(req.username) >= MAX_ROOMS_PER_USER) {
+    return res.status(400).json({ error: `部屋は同時に${MAX_ROOMS_PER_USER}個まで作成できます` });
+  }
+  const roomId = 'room_' + hashId(name + req.username + Date.now());
+  db.rooms[roomId] = { id: roomId, name, owner: req.username, createdAt: Date.now() };
+  db.boards[roomId] = { threads: {} };
+  saveData(db);
+  res.json(db.rooms[roomId]);
+});
+
+app.delete('/api/rooms/:roomId', requireUser, (req, res) => {
+  const room = getRoom(req.params.roomId);
+  if (!room) return res.status(404).json({ error: '部屋が見つかりません' });
+  if (room.owner !== req.username) {
+    return res.status(403).json({ error: '自分の部屋のみ削除できます' });
+  }
+  delete db.rooms[req.params.roomId];
+  delete db.boards[req.params.roomId];
+  saveData(db);
+  res.json({ ok: true });
 });
 
 // ==== 管理者ログイン ====
@@ -255,12 +473,14 @@ app.post('/api/admin/login', (req, res) => {
   }
   const token = crypto.randomBytes(24).toString('hex');
   adminSessions.set(token, Date.now() + ADMIN_SESSION_MS);
+  saveSessions();
   res.json({ token });
 });
 
 app.post('/api/admin/logout', (req, res) => {
   const token = req.headers['x-admin-token'];
   if (token) adminSessions.delete(token);
+  saveSessions();
   res.json({ ok: true });
 });
 
@@ -272,9 +492,10 @@ app.get('/api/admin/me', (req, res) => {
 const USERNAME_RE = /^[a-zA-Z0-9_ぁ-んァ-ヶー一-龠]{2,20}$/;
 
 app.post('/api/auth/register', (req, res) => {
-  let { username, password } = req.body || {};
+  let { username, password, accountMode } = req.body || {};
   username = (username || '').toString().trim();
   password = (password || '').toString();
+  accountMode = accountMode === 'public' ? 'public' : 'anonymous';
 
   if (!USERNAME_RE.test(username)) {
     return res.status(400).json({ error: 'ユーザー名は2〜20文字（英数字・かな・漢字・アンダースコア）で入力してください' });
@@ -291,6 +512,9 @@ app.post('/api/auth/register', (req, res) => {
     passwordSalt: salt,
     passwordHash: hashPassword(password, salt),
     createdAt: Date.now(),
+    accountMode,
+    displayName: accountMode === 'public' ? username : '',
+    bio: '',
     following: [],
     followedThreads: [],
   };
@@ -298,7 +522,8 @@ app.post('/api/auth/register', (req, res) => {
 
   const token = crypto.randomBytes(24).toString('hex');
   userSessions.set(token, { username, expires: Date.now() + USER_SESSION_MS });
-  res.json({ token, username });
+  saveSessions();
+  res.json({ token, username, accountMode });
 });
 
 app.post('/api/auth/login', (req, res) => {
@@ -318,28 +543,72 @@ app.post('/api/auth/login', (req, res) => {
 
   const token = crypto.randomBytes(24).toString('hex');
   userSessions.set(token, { username, expires: Date.now() + USER_SESSION_MS });
-  res.json({ token, username });
+  saveSessions();
+  res.json({ token, username, accountMode: user.accountMode || 'anonymous' });
 });
 
 app.post('/api/auth/logout', (req, res) => {
   const token = req.headers['x-user-token'];
   if (token) userSessions.delete(token);
+  saveSessions();
   res.json({ ok: true });
 });
 
 app.get('/api/auth/me', (req, res) => {
   const username = currentUsername(req);
-  res.json({ username: username || null });
+  if (!username) return res.json({ username: null });
+  const user = migrateUser(users[username]);
+  res.json({
+    username,
+    accountMode: user.accountMode,
+    displayName: user.displayName || '',
+    bio: user.bio || '',
+    roomCount: countUserRooms(username),
+    roomLimit: MAX_ROOMS_PER_USER,
+  });
+});
+
+app.put('/api/me/profile', requireUser, (req, res) => {
+  const user = users[req.username];
+  if (user.accountMode !== 'public') {
+    return res.status(403).json({ error: 'プロフィール設定は公開モードのアカウントのみ利用できます' });
+  }
+  let { displayName, bio } = req.body || {};
+  displayName = (displayName || '').toString().trim().slice(0, 20);
+  bio = (bio || '').toString().trim().slice(0, 200);
+  if (!displayName) displayName = req.username;
+  user.displayName = displayName;
+  user.bio = bio;
+  saveUsers(users);
+  res.json({ displayName: user.displayName, bio: user.bio });
+});
+
+app.post('/api/me/upgrade-public', requireUser, (req, res) => {
+  const user = users[req.username];
+  if (user.accountMode === 'public') {
+    return res.status(400).json({ error: '既に公開モードです' });
+  }
+  user.accountMode = 'public';
+  if (!user.displayName) user.displayName = req.username;
+  saveUsers(users);
+  res.json({ accountMode: 'public' });
 });
 
 // ==== フォロー機能 ====
 
-// スレッドをフォロー／解除
+// スレッドをフォロー／解除（公開モードのみ）
 app.post('/api/boards/:boardId/threads/:threadId/follow', requireUser, (req, res) => {
+  if (!isPublicUser(req.username)) {
+    return res.status(403).json({ error: 'フォロー機能は公開モードのアカウントのみ利用できます' });
+  }
   const { boardId, threadId } = req.params;
   const boardData = db.boards[boardId];
   if (!boardData || !boardData.threads[threadId]) {
     return res.status(404).json({ error: 'スレが見つかりません' });
+  }
+  const meta = findBoardMeta(boardId);
+  if (meta && meta.archived) {
+    return res.status(403).json({ error: 'アーカイブされた板のスレッドはフォローできません' });
   }
   const key = followedKey(boardId, threadId);
   const user = users[req.username];
@@ -353,10 +622,16 @@ app.post('/api/boards/:boardId/threads/:threadId/follow', requireUser, (req, res
   res.json({ following: follow });
 });
 
-// 投稿者をフォロー／解除
+// 投稿者をフォロー／解除（公開モード同士のみ）
 app.post('/api/users/:username/follow', requireUser, (req, res) => {
+  if (!isPublicUser(req.username)) {
+    return res.status(403).json({ error: 'フォロー機能は公開モードのアカウントのみ利用できます' });
+  }
   const target = req.params.username;
   if (!users[target]) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  if (!isPublicUser(target)) {
+    return res.status(403).json({ error: '匿名モードのユーザーはフォローできません' });
+  }
   if (target === req.username) return res.status(400).json({ error: '自分自身はフォローできません' });
 
   const me = users[req.username];
@@ -370,32 +645,43 @@ app.post('/api/users/:username/follow', requireUser, (req, res) => {
   res.json({ following: follow, followerCount: followerCountOf(target) });
 });
 
-// 特定ユーザーの公開プロフィール（フォロワー数など）
 app.get('/api/users/:username', (req, res) => {
   const target = req.params.username;
   if (!users[target]) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  const targetUser = migrateUser(users[target]);
   const viewer = currentUsername(req);
+
+  if (targetUser.accountMode !== 'public') {
+    return res.json({ username: target, accountMode: 'anonymous', isPublic: false });
+  }
+
   res.json({
     username: target,
+    accountMode: 'public',
+    isPublic: true,
+    displayName: targetUser.displayName || target,
+    bio: targetUser.bio || '',
     followerCount: followerCountOf(target),
-    followingCount: (users[target].following || []).length,
-    isFollowedByMe: viewer ? (users[viewer].following || []).includes(target) : false,
+    followingCount: (targetUser.following || []).length,
+    isFollowedByMe: viewer && isPublicUser(viewer)
+      ? (users[viewer].following || []).includes(target)
+      : false,
+    canDm: !!(viewer && isPublicUser(viewer) && viewer !== target),
   });
 });
 
-// マイページ：フォロー中のスレッド・ユーザー一覧
 app.get('/api/me/following', requireUser, (req, res) => {
-  const me = users[req.username];
+  const me = migrateUser(users[req.username]);
 
   const threads = (me.followedThreads || []).map(key => {
     const [boardId, threadId] = key.split(':');
     const boardData = db.boards[boardId];
     const thread = boardData && boardData.threads[threadId];
-    const boardMeta = BOARDS.find(b => b.id === boardId);
-    if (!thread) return null;
+    const boardMeta = findBoardMeta(boardId);
+    if (!thread || !boardMeta || boardMeta.archived) return null;
     return {
       boardId,
-      boardName: boardMeta ? boardMeta.name : boardId,
+      boardName: boardMeta.name,
       threadId,
       title: thread.title,
       resCount: thread.comments.length,
@@ -404,10 +690,94 @@ app.get('/api/me/following', requireUser, (req, res) => {
 
   const followingUsers = (me.following || []).map(username => ({
     username,
+    displayName: isPublicUser(username) ? (users[username].displayName || username) : username,
     followerCount: followerCountOf(username),
   }));
 
-  res.json({ threads, users: followingUsers });
+  const myRooms = Object.values(db.rooms || {})
+    .filter(r => r.owner === req.username)
+    .map(r => ({ id: r.id, name: r.name, createdAt: r.createdAt }));
+
+  res.json({
+    accountMode: me.accountMode,
+    displayName: me.displayName || '',
+    bio: me.bio || '',
+    threads,
+    users: followingUsers,
+    rooms: myRooms,
+    roomLimit: MAX_ROOMS_PER_USER,
+  });
+});
+
+app.get('/api/dm/conversations', requireUser, (req, res) => {
+  if (!isPublicUser(req.username)) {
+    return res.status(403).json({ error: 'DMは公開モードのアカウントのみ利用できます' });
+  }
+  const list = [];
+  for (const conv of Object.values(dms)) {
+    if (!conv.participants.includes(req.username)) continue;
+    const other = conv.participants.find(p => p !== req.username);
+    const last = conv.messages[conv.messages.length - 1];
+    list.push({
+      with: other,
+      displayName: isPublicUser(other) ? (users[other].displayName || other) : other,
+      lastMessage: last ? last.text.slice(0, 50) : '',
+      lastAt: last ? last.at : 0,
+      unread: conv.messages.filter(m => m.to === req.username && !m.read).length,
+    });
+  }
+  list.sort((a, b) => b.lastAt - a.lastAt);
+  res.json(list);
+});
+
+app.get('/api/dm/:username', requireUser, (req, res) => {
+  if (!isPublicUser(req.username)) {
+    return res.status(403).json({ error: 'DMは公開モードのアカウントのみ利用できます' });
+  }
+  const target = req.params.username;
+  if (!users[target]) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  if (!isPublicUser(target)) {
+    return res.status(403).json({ error: '匿名モードのユーザーにはDMを送れません' });
+  }
+  if (target === req.username) return res.status(400).json({ error: '自分自身にはDMを送れません' });
+
+  const key = dmKey(req.username, target);
+  const conv = dms[key] || { participants: [req.username, target], messages: [] };
+  conv.messages.forEach(m => {
+    if (m.to === req.username) m.read = true;
+  });
+  dms[key] = conv;
+  saveDms(dms);
+  res.json({
+    with: target,
+    displayName: users[target].displayName || target,
+    messages: conv.messages,
+  });
+});
+
+app.post('/api/dm/:username', requireUser, (req, res) => {
+  if (!isPublicUser(req.username)) {
+    return res.status(403).json({ error: 'DMは公開モードのアカウントのみ利用できます' });
+  }
+  const target = req.params.username;
+  if (!users[target]) return res.status(404).json({ error: 'ユーザーが見つかりません' });
+  if (!isPublicUser(target)) {
+    return res.status(403).json({ error: '匿名モードのユーザーにはDMを送れません' });
+  }
+  if (target === req.username) return res.status(400).json({ error: '自分自身にはDMを送れません' });
+
+  let { text } = req.body || {};
+  text = (text || '').toString().trim().slice(0, 500);
+  if (!text) return res.status(400).json({ error: 'メッセージを入力してください' });
+
+  const key = dmKey(req.username, target);
+  if (!dms[key]) {
+    dms[key] = { participants: [req.username, target], messages: [] };
+  }
+  const msg = { from: req.username, to: target, text, at: Date.now(), read: false };
+  dms[key].messages.push(msg);
+  saveDms(dms);
+  res.json(msg);
 });
 
 // ==== 広告枠API ====
@@ -443,7 +813,7 @@ app.put('/api/admin/ads/:slotId', requireAdmin, (req, res) => {
   res.json(adsConfig[slotId]);
 });
 
-app.get('/api/boards/:boardId/threads', (req, res) => {
+app.get('/api/boards/:boardId/threads', requireBoardAccess, (req, res) => {
   const boardData = db.boards[req.params.boardId];
   if (!boardData) return res.status(404).json({ error: '板が見つかりません' });
 
@@ -470,7 +840,7 @@ app.get('/api/boards/:boardId/threads', (req, res) => {
   res.json(threads);
 });
 
-app.get('/api/boards/:boardId/threads/:threadId', (req, res) => {
+app.get('/api/boards/:boardId/threads/:threadId', requireBoardAccess, (req, res) => {
   const boardId = req.params.boardId;
   const boardData = db.boards[boardId];
   if (!boardData) return res.status(404).json({ error: '板が見つかりません' });
@@ -483,11 +853,18 @@ app.get('/api/boards/:boardId/threads/:threadId', (req, res) => {
     : false;
   const viewerFollowing = username ? (users[username].following || []) : [];
 
-  res.json(Object.assign({}, thread, { followedByMe, viewerUsername: username, viewerFollowing }));
+  const boardMeta = findBoardMeta(boardId);
+  res.json(Object.assign({}, thread, {
+    followedByMe,
+    viewerUsername: username,
+    viewerFollowing: username ? (users[username].following || []) : [],
+    viewerCanFollow: username ? isPublicUser(username) : false,
+    boardArchived: !!(boardMeta && boardMeta.archived),
+    isRoom: isRoomBoard(boardId),
+  }));
 });
 
-// ユーザーによる新規スレッド作成（「サイトのお知らせ」板は管理者のみ）
-app.post('/api/boards/:boardId/threads', (req, res) => {
+app.post('/api/boards/:boardId/threads', requireBoardAccess, (req, res) => {
   const boardId = req.params.boardId;
   const boardData = db.boards[boardId];
   if (!boardData) return res.status(404).json({ error: '板が見つかりません' });
@@ -523,7 +900,7 @@ app.post('/api/boards/:boardId/threads', (req, res) => {
   res.json(thread);
 });
 
-app.post('/api/boards/:boardId/threads/:threadId/comments', (req, res) => {
+app.post('/api/boards/:boardId/threads/:threadId/comments', requireBoardAccess, (req, res) => {
   const boardData = db.boards[req.params.boardId];
   if (!boardData) return res.status(404).json({ error: '板が見つかりません' });
   const thread = boardData.threads[req.params.threadId];
@@ -537,7 +914,7 @@ app.post('/api/boards/:boardId/threads/:threadId/comments', (req, res) => {
   if (admin) {
     name = name || '運営';
   } else if (username) {
-    name = `名無しさん@${username}`; // ログイン中は「名無しさん@ユーザー名」形式で固定（フォロー機能のため実体はusernameで管理）
+    name = displayNameOf(username);
   } else {
     name = name || '名無しさん';
   }
@@ -559,7 +936,7 @@ app.post('/api/boards/:boardId/threads/:threadId/comments', (req, res) => {
 });
 
 // いいね／いいね解除（レス番号1は記事本文＝OP扱い）
-app.post('/api/boards/:boardId/threads/:threadId/posts/:no/like', (req, res) => {
+app.post('/api/boards/:boardId/threads/:threadId/posts/:no/like', requireBoardAccess, (req, res) => {
   const boardData = db.boards[req.params.boardId];
   if (!boardData) return res.status(404).json({ error: '板が見つかりません' });
   const thread = boardData.threads[req.params.threadId];
@@ -609,10 +986,10 @@ app.post('/api/boards/:boardId/threads/:threadId/posts/:no/moderate', requireAdm
   res.json({ no, moderation });
 });
 
-// 全板横断の勢いランキング
 app.get('/api/ikioi', (req, res) => {
   const all = [];
-  for (const b of BOARDS) {
+  for (const b of getAllBoardsMeta()) {
+    if (b.archived || b.isRoom) continue;
     const boardData = db.boards[b.id];
     if (!boardData) continue;
     for (const t of Object.values(boardData.threads)) {
@@ -635,6 +1012,7 @@ app.get('/api/ikioi', (req, res) => {
 });
 
 app.listen(PORT, () => {
+  loadSessions();
   console.log(`こっちゃんねる サーバー起動: http://localhost:${PORT}`);
   refreshAllBoards();
   setInterval(refreshAllBoards, REFRESH_INTERVAL_MS);

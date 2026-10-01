@@ -27,7 +27,7 @@ body {
   will-change: transform;
 }
 
-a { color: #0004ff; text-decoration: none; }
+a { color: #0000ee; text-decoration: none; }
 a:visited { color: #551a8b; }
 a:hover { text-decoration: underline; }
 

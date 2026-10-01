@@ -2,6 +2,8 @@ node_modules/
 data/board.json
 data/ads.json
 data/users.json
+data/sessions.json
+data/dms.json
 public/bg.jpg
 public/bg.png
 .DS_Store
