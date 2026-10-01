@@ -1011,7 +1011,8 @@ app.get('/api/ikioi', (req, res) => {
   res.json(all.slice(0, 30));
 });
 
-app.listen(PORT, () => {
+
+app.listen(PORT, "0.0.0.0", () => {
   loadSessions();
   console.log(`こっちゃんねる サーバー起動: http://localhost:${PORT}`);
   refreshAllBoards();
